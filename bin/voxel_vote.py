@@ -1,34 +1,55 @@
 #!/usr/bin/env python
 import logging
-FORMAT = '%(asctime)-15s %(name)s %(levelname)s: %(message)s'
-logging.basicConfig(format=FORMAT, level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-logger.debug("Starting imports...")
 import subprocess
 from pyminc.volumes.factory import *
 from numpy import *
 from scipy.stats import *
 from optparse import OptionParser
 
-logger.debug("Done imports.  Starting program")
-
-def execute(command, input = ""):
+def execute(command, input = "", dry_run = False, stdout = 2):
     """Spins off a subprocess to run the cgiven command"""
-    logger.debug("Running: " + command + " on:\n" + input)
+      
+    if not dry_run:
+        proc = subprocess.Popen(command.split(), 
+                                stdin = subprocess.PIPE, stdout = stdout, stderr = 2)
+        out, err = proc.communicate(input)
+        if proc.returncode != 0: 
+            raise Exception("Returns %i :: %s" %( proc.returncode, command ))
+        return (out, err)
+
+# Copied ungraciously from scipy.stats.mstats_basic.py
+# And then tweaked
+def unbiased_mode(a, axis=0):
+    #scores = np.unique(np.ravel(a))      # get ALL unique values
+    testshape = list(a.shape)
+    testshape[axis] = 1
+    oldmostfreq = np.zeros(testshape)
+    oldcounts = np.zeros(testshape)
+
+    for score in scores:
+        template = (a == score)
+        counts = np.expand_dims(np.sum(template, axis),axis)
+        mostfrequent = np.where(counts > oldcounts, score, oldmostfreq)
+        oldcounts = np.maximum(counts, oldcounts)
+        oldmostfreq = mostfrequent
     
-    proc = subprocess.Popen(command.split(), 
-                            stdin = subprocess.PIPE, stdout = 2, stderr = 2)
-    proc.communicate(input)
-    if proc.returncode != 0: 
-        raise Exception("Returns %i :: %s" %( proc.returncode, command ))
+    return mostfrequent, oldcounts
 
 if __name__ == "__main__":
+
+    FORMAT = '%(asctime)-15s %(name)s %(levelname)s: %(message)s'
+    logging.basicConfig(format=FORMAT, level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
     usage = "Usage text"
     description = "Description text"
     
     parser = OptionParser(usage=usage, description=description)
+    parser.add_option("--nondeterministic", dest="unbiased_mode",
+                      help="Use custom (and likely slower) implementation of "
+                           "majority vote that is unbiased to label values",
+                      action="store_true", default=False)
     parser.add_option("--clobber", dest="clobber",
                       help="clobber output file",
                       type="string")
@@ -41,8 +62,16 @@ if __name__ == "__main__":
 
     outfilename = args[-1]
     
+   
+    if options.unbiased_mode: 
+        import numpy as np
+        o, e = execute("print_all_labels %s" % args[0], stdout = subprocess.PIPE)
+        scores = [ int(line.split(" ")[1]) for line in o.strip().split("\n") ]
+        scores.append(0)
+        np.random.shuffle(scores)
+        mode = unbiased_mode
     
-    # clobber check should go here
+    #TODO: clobber check should go here
     
     volhandles = []
 
