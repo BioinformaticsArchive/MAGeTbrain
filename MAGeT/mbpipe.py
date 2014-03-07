@@ -9,6 +9,7 @@ import os, os.path
 import glob
 import string
 import sys
+import stat
 import errno
 from collections import defaultdict
 from os.path import join, exists, basename, dirname
@@ -32,37 +33,49 @@ logging.root.addHandler(hdlr)
 logging.root.setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+def random_string(self, length = 4): 
+  return str(uuid4()).replace('-', '')[:length]
+
 ### Pipeline construction
 class CommandQueue(object):
   def __init__(self):
-    self.commands = {}  # stage -> [command, ...]
     self.dry_run = False
+    self.name_length = 16
 
   def set_dry_run(self, state):
     self.dry_run = state
 
-  def append_commands(self, stage, commands):
-    command_list = self.commands.get(stage, [])
-    command_list.extend(commands)
-    self.commands[stage] = command_list
+  def _runnable_command(self, command, name = None): 
+    """Convert a tuple to string, and taskset to script"""
+    if isinstance(command, tuple): 
+      return " ".join(map(str, command))
+    if isinstance(command, taskset): 
+      script = name or self._get_script_name()
+      #script = '{}-{}.sh'.format(stage,index)
+      command.write_to_script(script)
+      os.chmod(script, stat.S_IRWXU)
+      return script
+    return command
 
-  def run(self, stages = []):
-    """Runs the given stages, in order, or all if none are supplied"""
-    if not stages:
-      stages = self.commands.keys()
+  def make_dirs(self, outputfiles): 
+    dirs = set(map(lambda x: x.dirname, outputfiles))
+    logger.debug("Making directories: \n\t" + "\n\t".join(dirs))
+    if not self.dry_run:
+      map(mkdirp, dirs)
+    
+  def run(self, tasklist):
+    """Runs the tasklist"""
+    flat = tasklist.flatten()
 
-    for stage in [s for s in stages if s in self.commands.keys()]:
-      for command in self.commands[stage]:
-        self.execute(command)
+    # make output directories
+    self.make_dirs(flat.get_all_outputfiles())
 
-  def __str__(self):
-    __str = 'Pipeline:\n'
-    for stage, commands in self.commands.items():
-      __str += 'STAGE: {0}\n'.format(stage)
-      __str += '  '+'\n  '.join(commands)
-    return __str
+    # execute the incomplete stages
+    for stage in flat.stage_order:
+      for index, command in enumerate(flat.get_commands(stage, False)):
+        self._execute(self._runnable_command(command))
 
-  def execute(self, command, input = ""):
+  def _execute(self, command, input = ""):
     """Spins off a subprocess to run the cgiven command"""
     if input:
       logger.debug("exec: {0}\n\t{1}".format(command, input.replace('\n','\n\t')))
@@ -82,30 +95,22 @@ class ParallelCommandQueue(CommandQueue):
     CommandQueue.__init__(self)
     self.processors = processors
 
-  def run(self, stages):
-    if not stages:
-      stages = self.commands.keys()
+  def run(self, tasklist):
+    flat = tasklist.flatten()
 
-    previous_stage = STAGE_NONE
-    for stage in [s for s in stages if s in self.commands.keys()]:
-      if self.commands[stage]:
-        self.parallel(self.commands[stage])
-        previous_stage = stage
+    # make output directories
+    self.make_dirs(flat.get_all_outputfiles())
+
+    for stage in flat.stage_order:
+      commands = flat.get_commands(stage, complete=False)
+      commands = map(lambda c: self._runnable_command(c), commands)
+      if commands:
+        self.parallel(commands)
 
   def parallel(self, commands):
     "Runs the list of commands through parallel"
     command = 'parallel -j%i' % self.processors
-    self.execute(command, input='\n'.join(commands))
-
-class ScriptCommandQueue(CommandQueue):
-  def __init__(self, scriptname, processes=8):
-    CommandQueue.__init__(self)
-    self.scriptname = scriptname
-    self.processes  = processes
-  def run(self, stages=None):
-    if not stages:
-      stages = self.commands.keys()
-
+    self._execute(command, input='\n'.join(commands))
 
 class QBatchCommandQueue(CommandQueue):
   def __init__(self, processors = 8, batch='pbs',hints=None,walltime='1:00:00'):
@@ -116,27 +121,45 @@ class QBatchCommandQueue(CommandQueue):
     self.hints = hints or dict()
     self.walltime = walltime
 
-  def run(self, stages):
-    if not stages:
-      stages = self.commands.keys()
+  def run(self, tasklist):
+    previous_stage = ""
 
-    previous_stage = STAGE_NONE
-    for stage in [s for s in stages if s in self.commands.keys()]:
-      if self.commands[stage]:
-        unique_stage = "{0}_{1}".format(stage,
-            ''.join([random.choice(string.letters) for i in xrange(4)]))
+    run_id = random_string(length=5)
 
-        walltime = self.walltime
-        if stage in self.hints and 'walltime' in self.hints[stage]:
-          walltime   = self.hints[stage]['walltime']
+    # make output directories
+    self.make_dirs(tasklist.get_all_outputfiles())
 
-        processors = self.processors
-        if stage in self.hints and 'procs' in self.hints[stage]:
-          processors = stage_queue_hints[stage]['procs']
+    for stage in tasklist.stage_order:
+      commands = tasklist.get_commands(stage, complete=False)
+      if not commands:
+        continue
+      
+      # unique name to avoid clashes
+      stage_name= "{0}_{1}".format(stage, run_id)
 
-        self.qbatch(self.commands[stage], batch_name=unique_stage, afterok=previous_stage+"*",
-            walltime=walltime, processors = processors)
-        previous_stage = unique_stage
+      # get job meta data
+      walltime = self.walltime
+      if stage in self.hints and 'walltime' in self.hints[stage]:
+        walltime   = self.hints[stage]['walltime']
+
+      processors = self.processors
+      if stage in self.hints and 'procs' in self.hints[stage]:
+        processors = stage_queue_hints[stage]['procs']
+
+      # convert any sub pipelines into scripts
+      runnable_commands = []
+      for index, command in enumerate(commands):
+        runnable_commands.append(self._runnable_command(command,
+            name="{}-{}.sh".format(stage_name,index)))
+
+      # queue up the commands
+      self.qbatch(runnable_commands,
+          batch_name = stage_name, 
+          afterok    = previous_stage+"*",
+          walltime   = walltime, 
+          processors = processors)
+
+      previous_stage = stage_name 
 
   def qbatch(self, commands, batch_name = None, afterok=None, walltime="10:00:00", processors = None):
     logger.info('running {0} commands after stage {1}'.format(len(commands), afterok))
@@ -144,7 +167,7 @@ class QBatchCommandQueue(CommandQueue):
     opt_name    = batch_name and '-N {0}'.format(batch_name) or ''
     opt_afterok = afterok and '--afterok_pattern {0}'.format(afterok) or ''
     batchsize   = min(self.processors, processors)
-    self.execute('qbatch --batch_system {0} {1} {2} - {3} {4}'.format(
+    self._execute('qbatch --batch_system {0} {1} {2} - {3} {4}'.format(
         self.batch, opt_name, opt_afterok, batchsize, walltime),
         input='\n'.join(commands))
 
@@ -242,12 +265,15 @@ class taskset:
       def command(self, *args):
         t.command(stage_name,args)
     return _stage()
+
   def command(self,stage,cmd):
     self.stages[stage].append(cmd)
     if stage not in self.stage_order: self.stage_order.append(stage)
+
   def set_stage_order(self, order):
     assert set(order).issubset(set(self.stages.keys)), "some stages given are not part of this taskset"
     self.stage_order = order
+
   def __str__(self):
     __str=""
     for stage in self.stage_order:
@@ -255,35 +281,47 @@ class taskset:
       for command in self.stages[stage]:
         __str += '\t{0}\n'.format(' '.join(map(str,command)))
     return __str
-  def populate_queue(self, commandqueue):
-    for stage in self.stages:
-      commands    = filter(lambda x: isinstance(x,tuple), self.stages[stage])
-      subtasksets = filter(lambda x: isinstance(x,taskset), self.stages[stage])
-      unfinished, outputs = self._filter_unfinished(commands)
 
-      if not unfinished and not subtasksets:
-        continue
-      
-      # make output dirs directories
-      map(mkdirp, set(map(lambda x: x.dirname, chain(*outputs))))
+  def _is_outputfile_complete(self, outputfile):
+    return os.path.isfile(str(outputfile))
 
-      cmds = map(lambda command: " ".join(map(str,command)), unfinished)
-      commandqueue.append_commands(stage, set(cmds))
+  def _is_command_complete(self, command): 
+    if isinstance(command,taskset) and not command.is_complete(): 
+      return False
 
-  def runqueue(self, commandqueue, populate=True):
-    if populate:
-        self.populate_queue(commandqueue)
-    commandqueue.run(self.stage_order)
+    outputfiles = filter(lambda x: isinstance(x,out),command)
+    if not all(map(lambda x: self._is_outputfile_complete(x), outputfiles)):
+      return False
 
-  def _filter_unfinished(self,commands):
-    """returns tuple of each unfinished command, and a list of its output files"""
-    details  = [(c,filter(lambda x: isinstance(x,out),c)) for c in commands]
-    filtered = [(c,o) for (c,o) in details if not all(map(lambda x: os.path.isfile(str(x)),o))]
-    if filtered:
-        unfinished, outputs = zip(*filtered)
-    else:
-        unfinished, outputs = (), ()
-    return (unfinished, outputs)
+    return True
+
+  def is_complete(self): 
+    for command in self.stages.itervalues():
+      if not self._is_command_complete(command):
+        return false
+    return true 
+
+  def _filter_unfinished(self,all_commands):
+    """returns only those commands that have not yet completed"""
+    return filter(lambda x: not self._is_command_complete(x), all_commands)
+
+  def get_commands(self, stage, complete=True):
+    all_commands = self.stages[stage]
+    if complete: 
+      return all_commands
+    else: 
+      return self._filter_unfinished(all_commands)
+
+  def get_all_outputfiles(self): 
+    o = map(lambda x: self.get_command_outputfiles(x),
+        chain(*self.stages.values()))
+    return list(chain(*o))
+
+  def get_command_outputfiles(self, command): 
+    if isinstance(command,taskset):
+      return command.get_all_outputfiles() 
+
+    return filter(lambda x: isinstance(x,out),command)
 
   def flatten(self,tasklist = None, prefix = ""):
     tasklist    = tasklist or taskset()
@@ -319,14 +357,11 @@ class taskset:
     script.write('\necho "DONE!!!!"\n')
     script.close()
 
-
-
   def _script_commands(self,buffer,processes,stage_name,commands,use_parallel=True):
     """Given a buffer, write out the shell commands to run the given stage's commands"""
     if not commands:
       return 
 
-    print stage_name, commands
     details = [(c,filter(lambda x: isinstance(x,out),c)) for c in commands]
     runnable, outputs = zip(*details)
 
@@ -350,75 +385,6 @@ class taskset:
       buffer.write("parallel -j{0} <<EOF\n".format(processes))
       buffer.write('\n'.join(shell_commands) + '\n')
       buffer.write('EOF\n')
-
-def run_command(command):
-  cmdstr = " ".join(map(str,command))
-  print >> sys.stderr, 'COMMAND:', cmdstr
-  return call(cmdstr,shell=True)
-
-class multiprocqueue:
-  def run(self,tasks,processes=None,stage_order=None):
-    """Runs the commands from the given stages in the task list.
-
-       If stages isn't provided, then all stages are run. """
-    stage_order = stage_order or tasks.stage_order
-    for stage in stage_order:
-      print '## stage:', stage,'##'
-
-      #
-      unfinished, outputs = self._filter_unfinished(tasks.stages[stage])
-      if not unfinished:
-        continue
-
-      # make output dirs directories
-      map(mkdirp, set(map(lambda x: x.dirname, chain(*outputs))))
-
-      # actually run the stages
-      results = self._run(unfinished, stage, processes)
-
-      print 'results ---',results
-      #TODO: assert that there were no errors
-      if not all(map(lambda x: x==0,results)):
-        print "Error in stage {0}. Exiting...".format(stage)
-        return -1
-
-  def _run(self,commands,stage, processes=None):
-    return Pool(processes).map(run_command, commands)
-
-  def _filter_unfinished(self,commands):
-    """returns tuple of each unfinished command, and a list of its output files"""
-    details = [(c,filter(lambda x: isinstance(x,out),c)) for c in commands]
-    filtered = [(c,o) for (c,o) in details if not all(map(lambda x: os.path.isfile(str(x)),o))]
-    if filtered:
-        unfinished, outputs = zip(*filtered)
-    else:
-        unfinished, outputs = (), ()
-    return (unfinished, outputs)
-
-class scriptqueue(multiprocqueue):
-  def __init__(self):
-    self.stage = 1
-
-  def _run(self,commands,stage,processes=None):
-    open('{0}_{1}.sh'.format(self.stage,stage),'w').write(
-        "\n".join(map(lambda x: " ".join(map(str,x)),commands))+'\n')
-    self.stage += 1
-    return [0]
-
-class batcharrayqueue(multiprocqueue):
-  def __init__(self):
-    self.stage = 1
-
-  def _run(self,commands,stage,processes=None):
-    task_list='{0}_{1}.sh'.format(self.stage,stage)
-    open(task_list,'w').write(
-        "\n".join(map(lambda x: " ".join(map(str,x)),commands))+'\n')
-    execute('echo qarray {task_list}'.format(**vars()))
-    self.stage += 1
-    return [0]
-
-
-
 
 ### utility functions
 def mkdirp(*p):

@@ -315,12 +315,10 @@ def main():
 	if options.write_to_script:
 		tasklist.write_to_script('script.sh', options.processes)
 
-	flat_pipeline = tasklist.flatten()
-	flat_pipeline.populate_queue(queue)
-	if not queue.commands:
+	if not tasklist.stages:
 		print "Nothing to do."
 	else:
-		flat_pipeline.runqueue(queue, populate=False)
+		queue.run(tasklist) 
 
 if __name__ == '__main__':
 	main()
