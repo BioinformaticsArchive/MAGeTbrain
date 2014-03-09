@@ -2,6 +2,8 @@
 # vim: set ts=2 sw=2:
 import logging
 from itertools import chain
+import pipes
+import shlex
 import datetime
 import random
 import subprocess
@@ -11,6 +13,7 @@ import string
 import sys
 import stat
 import errno
+from uuid import uuid4
 from collections import defaultdict
 from os.path import join, exists, basename, dirname
 
@@ -33,8 +36,19 @@ logging.root.addHandler(hdlr)
 logging.root.setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+## utils
 def random_string(self, length = 4): 
   return str(uuid4()).replace('-', '')[:length]
+
+def shsplit(*args): 
+  """Split a list by shell lexer"""
+  def split(x):
+    if isinstance(x, str): 
+      return shlex.split(x)
+    else:
+      return [x]
+
+  return chain(*map(split,args))
 
 ### Pipeline construction
 class CommandQueue(object):
@@ -46,10 +60,10 @@ class CommandQueue(object):
     self.dry_run = state
 
   def _runnable_command(self, command, name = None): 
-    """Convert a tuple to string, and taskset to script"""
+    """Convert a tuple to string, and pipeline to script"""
     if isinstance(command, tuple): 
       return " ".join(map(str, command))
-    if isinstance(command, taskset): 
+    if isinstance(command, pipeline): 
       script = name or self._get_script_name()
       #script = '{}-{}.sh'.format(stage,index)
       command.write_to_script(script)
@@ -63,9 +77,9 @@ class CommandQueue(object):
     if not self.dry_run:
       map(mkdirp, dirs)
     
-  def run(self, tasklist):
-    """Runs the tasklist"""
-    flat = tasklist.flatten()
+  def run(self, p):
+    """Runs the p"""
+    flat = p.flatten()
 
     # make output directories
     self.make_dirs(flat.get_all_outputfiles())
@@ -95,8 +109,8 @@ class ParallelCommandQueue(CommandQueue):
     CommandQueue.__init__(self)
     self.processors = processors
 
-  def run(self, tasklist):
-    flat = tasklist.flatten()
+  def run(self, p):
+    flat = p.flatten()
 
     # make output directories
     self.make_dirs(flat.get_all_outputfiles())
@@ -121,16 +135,16 @@ class QBatchCommandQueue(CommandQueue):
     self.hints = hints or dict()
     self.walltime = walltime
 
-  def run(self, tasklist):
+  def run(self, p):
     previous_stage = ""
 
     run_id = random_string(length=5)
 
     # make output directories
-    self.make_dirs(tasklist.get_all_outputfiles())
+    self.make_dirs(p.get_all_outputfiles())
 
-    for stage in tasklist.stage_order:
-      commands = tasklist.get_commands(stage, complete=False)
+    for stage in p.stage_order:
+      commands = p.get_commands(stage, complete=False)
       if not commands:
         continue
       
@@ -193,20 +207,23 @@ class Template:
 
 
 # new style?
-class datafile:
+class datafile():
   def __init__(self, path):
-    self.path = path
-    self.abspath = os.path.abspath(path)
+    self.update(path)
+  def update(self, path):
+    self.path     = path
+    self.abspath  = os.path.abspath(path)
     self.basename = os.path.basename(path)
-    self.dirname = os.path.dirname(path)
+    self.dirname  = os.path.dirname(path)
     self.realpath = os.path.realpath(path)
-    self.stem = os.path.splitext(self.basename)[0]
+    self.stem     = os.path.splitext(self.basename)[0]
+  def format(__self, *a, **v):
+    __self.update(__self.path.format(*a,**v))
+    return __self
   def exists(self):
     return os.path.isfile(self.realpath)
-  def __str__(self):
-    return self.abspath
   def __repr__(self):
-    return self.realpath
+    return self.path
   def __eq__(self, other):
     if isinstance(other,self.__class__):
       return os.path.realpath(self.abspath) == os.path.realpath(other.abspath)
@@ -220,6 +237,25 @@ class datafile:
 class out(datafile):
   pass
 
+class temp(datafile):
+  pass
+
+class tempdir:
+  def __init__(self, dir=None):
+    self.files = []
+    self.dir = dir
+  def out(self, path):
+    assert not path.startswith('/'), "Path must be relative"
+    o = out(path)
+    self.files.append(o)
+    return o
+  def resolve(self, id=None, basepath='/dev/shm'):
+    """Set all output files as contained in this basepath"""
+    id  = id or random_string()
+    self.dir = self.dir or os.path.join(basepath,id)
+    for f in self.files:
+      f.update(os.path.join(dir,f.path))
+
 class image(datafile):
   def objects(self):
     return map(datafile, glob.glob('{0.dirname}/../objects/*.obj'.format(self)))
@@ -228,53 +264,41 @@ class image(datafile):
         glob.glob('{0.dirname}/../labels/{0.stem}_labels.mnc'.format(self)))
 
 class command:
-  def __init__(self, fmt_string, *args, **kwargs):
-    cmdstr = fmt_string.format(*args,**kwargs)
-    self.__init__(shlex.split(cmdstr))  # split it up into parts
-    #
-    #todo: we could augment the usual string formatting syntax to include
-    #      the ability to indicate types (e.g. that an argument is an 'out'put
-    #      file.
-    #
-    #      Ideas:
-    #         # 1. use <Type>@<string> to mean
-    #         #   call Type(string), as in:
-    #         nuc_correct {0} out@{output_dir}/nuc/{0.stem}
-    #
-    #         # Q: what if there are @ characters in the string?
-    #         # A: too bad. :-)  But honestly, we could just check for strings
-    #         that match $\w+@ so that the only strings that may get confused
-    #         are those that happen to start with out@ and are NOT mean to be
-    #         interpreted as types.
-    #
-    #         # 2. use the conversion option for output files: o
-    #         bestlinreg {from} {to} {xfm!o} {resampled!o}
+  def __init__(__self, *args, **v):
+    """Initialise.
+    Uses __self instead of 'self' to avoid name clashes. Dirty."""
+    __self.args = [part.format(**v) for part in shsplit(*args)]
+  def is_complete(self): 
+    return all([os.path.isfile(str(o)) for o in self.args if isinstance(o,out)])
+  def __str__(self): 
+    return " ".join(map(pipes.quote, map(str, self.args)))
+  def __iter__(self): 
+    return self.args.__iter__()
 
-  def __init__(self, *args):
-    #todo: sanity checks
-    self.cmd = args
-
-class taskset:
+class pipeline:
   def __init__(self):
     self.stages = defaultdict(list)
     self.stage_order = []
-  def stage(self,stage_name):
-    """syntactic sugar"""
-    t = self
-    class _stage():
-      def command(self, *args):
-        t.command(stage_name,args)
-    return _stage()
+    self.vars = {}
 
-  def command(self,stage,cmd):
-    self.stages[stage].append(cmd)
-    if stage not in self.stage_order: self.stage_order.append(stage)
+  def command(__self,stage,*cmd,**kwargs):
+    if len(cmd) == 1 and isinstance(cmd[0],command):
+      c = cmd[0]
+    else:
+      vars_copy = __self.vars.copy()  # vars to resolve with
+      vars_copy.update(kwargs)     
+      if 'self' in vars_copy: del vars_copy['self']
+      c = command(*cmd,**vars_copy)
+
+    __self.stages[stage].append(c)
+    if stage not in __self.stage_order: __self.stage_order.append(stage)
 
   def set_stage_order(self, order):
-    assert set(order).issubset(set(self.stages.keys)), "some stages given are not part of this taskset"
+    assert set(order).issubset(set(self.stages.keys)), \
+      "some stages given are not part of this pipeline"
     self.stage_order = order
 
-  def __str__(self):
+  def __repr__(self):
     __str=""
     for stage in self.stage_order:
       __str += '{0}:\n'.format(stage)
@@ -282,28 +306,21 @@ class taskset:
         __str += '\t{0}\n'.format(' '.join(map(str,command)))
     return __str
 
-  def _is_outputfile_complete(self, outputfile):
-    return os.path.isfile(str(outputfile))
+  def __iter__(self): 
+    return self.stages.itervalues()
 
-  def _is_command_complete(self, command): 
-    if isinstance(command,taskset) and not command.is_complete(): 
-      return False
-
-    outputfiles = filter(lambda x: isinstance(x,out),command)
-    if not all(map(lambda x: self._is_outputfile_complete(x), outputfiles)):
-      return False
-
-    return True
+  def format(__self, **vars):
+    pass
 
   def is_complete(self): 
     for command in self.stages.itervalues():
-      if not self._is_command_complete(command):
+      if not command.is_complete():      # exit, right away
         return false
     return true 
 
   def _filter_unfinished(self,all_commands):
     """returns only those commands that have not yet completed"""
-    return filter(lambda x: not self._is_command_complete(x), all_commands)
+    return [c for c in all_commands if not c.is_complete()]
 
   def get_commands(self, stage, complete=True):
     all_commands = self.stages[stage]
@@ -318,24 +335,24 @@ class taskset:
     return list(chain(*o))
 
   def get_command_outputfiles(self, command): 
-    if isinstance(command,taskset):
+    if isinstance(command,pipeline):
       return command.get_all_outputfiles() 
 
     return filter(lambda x: isinstance(x,out),command)
 
-  def flatten(self,tasklist = None, prefix = ""):
-    tasklist    = tasklist or taskset()
+  def flatten(self,p = None, prefix = ""):
+    p = p or pipeline()
 
     for stage in self.stage_order:
-      stage_name  = prefix and "{}:{}".format(prefix,stage) or stage
-      commands    = filter(lambda x: isinstance(x,tuple),   self.stages[stage])
-      subtasksets = filter(lambda x: isinstance(x,taskset), self.stages[stage])
+      stage_name   = prefix and "{}:{}".format(prefix,stage) or stage
+      commands     = filter(lambda x: isinstance(x,tuple),   self.stages[stage])
+      subpipelines = filter(lambda x: isinstance(x,pipeline), self.stages[stage])
 
       for i in commands:
-        tasklist.command(stage_name, i)
-      for i in subtasksets:
-        flat = i.flatten(tasklist, stage_name)
-    return tasklist
+        p.command(stage_name, i)
+      for i in subpipelines:
+        flat = i.flatten(p, stage_name)
+    return p
 
   def write_to_script(self,scriptname,processes=8):
     script = open(scriptname,'w')
